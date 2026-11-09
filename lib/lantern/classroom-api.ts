@@ -1,0 +1,133 @@
+import {classSession,classSessionCookie,classLogout,assertStudentIdentity} from './class-session.mjs';
+import {captureCredential} from './credential-vault.mjs';
+import {readLearningInfo,writeLearningInfo} from './learning-info.mjs';
+import {normalizeClassCode,hashClassCode,verifyClassCode} from './class-code.mjs';
+import {exampleForRegion} from './example-data.mjs';
+import {validateRegion} from './region.mjs';
+import {preservedEntryAction,preservedEntryRole} from './preserved-entry.mjs';
+import {deleteOwnClass} from './class-delete.ts';
+import {unusedFiles,cleanupFiles} from './cleanup.ts';
+import {classBackup} from './class-backup.ts';
+import {privateFile} from './private-file.ts';
+import {editRoster,restoreStudent,renumberStudent} from './roster-api.ts';
+import {readOperatingPolicy,usageForClass,reserveUpload,releaseUpload} from './operations.mjs';
+import {hashPassword,verifyPassword,randomToken,digest,namePassword,validateWork,checkFile,canReadFile,MAX_FILE} from './domain.mjs';
+type Store={DB:D1Database;BUCKET:R2Bucket;PRESERVED_CLASS_CODE_HASH?:string;PRESERVED_TEACHER_CODE_HASH?:string;CREDENTIAL_VAULT_KEY?:string};
+const json=(v:unknown,status=200,headers:Record<string,string>={})=>Response.json(v,{status,headers:{'Cache-Control':'no-store','X-Robots-Tag':'noindex, nofollow, noarchive',...headers}});
+function fail(message:string,status=400):never{throw Object.assign(Error(message),{status})}
+const parse=(s:string|null)=>s?JSON.parse(s):null;
+async function read(req:Request){if(Number(req.headers.get('content-length'))>262144)fail('입력 내용이 너무 커요.',413);const raw=await req.text();if(new TextEncoder().encode(raw).length>262144)fail('입력 내용이 너무 커요.',413);try{return JSON.parse(raw)}catch{fail('입력 내용을 확인해 주세요.')}}
+async function limit(e:Store,req:Request,kind:string,max:number){const key=await digest('rooms:'+kind+':'+(req.headers.get('cf-connecting-ip')||'local')+':'+Math.floor(Date.now()/900000));await e.DB.prepare('INSERT INTO limits(key,count,expires) VALUES(?,1,?) ON CONFLICT(key) DO UPDATE SET count=count+1').bind(key,Date.now()+900000).run();const row=await e.DB.prepare('SELECT count FROM limits WHERE key=?').bind(key).first<{count:number}>();if(row!.count>max)fail('시도가 많아요. 15분 후 다시 시도해 주세요.',429);}
+// Share only the approved teacher example; student work and drafts never cross classrooms.
+async function classroomExample(e:Store,roomId:string){
+ const marker=await e.DB.prepare("SELECT value FROM settings WHERE key='legacy_classroom_migrated'").first<any>();if(marker?.value===roomId)return null;
+ const local=await e.DB.prepare('SELECT region FROM classrooms WHERE id=?').bind(roomId).first<any>();
+ const published=exampleForRegion(local?.region||'우리 지역');
+ const maximum=await e.DB.prepare('SELECT MAX(number) AS maximum FROM class_students WHERE class_id=?').bind(roomId).first<any>();
+ return {sourceRoom:'',student:{id:String(Math.max(40,(maximum?.maximum||0)+1)),name:'교사용',animal:21,isExample:true,published,draft:published,submitted:published,status:'approved',revision:0}};
+
+}
+async function createClassroom(req:Request,e:Store){
+ await limit(e,req,'create',8);const p=await readOperatingPolicy(e);if(p.newClassesPaused)fail('신규 학급 개설이 잠시 중지됐어요.',503);if((await e.DB.prepare('SELECT COUNT(*) AS n FROM classrooms').first<any>()).n>=p.maxClasses)fail('신규 학급 수 한도에 도달했어요.',503);const b=await read(req);
+ if(typeof b.school!=='string'||!b.school.trim().endsWith('초등학교')||b.school.length>60||typeof b.label!=='string'||!b.label.trim()||b.label.length>40)fail('초등학교 이름과 학급을 입력해 주세요.');
+ if(typeof b.password!=='string'||b.password.length<8||b.password.length>128||typeof b.code!=='string'||normalizeClassCode(b.code).length<6||normalizeClassCode(b.code).length>64)fail('교사 비밀번호는 8자 이상, 학급 입장 코드는 6자 이상으로 정해 주세요.');
+ if(await preservedEntryRole(b.code,e))fail('이미 사용 중인 입장 코드예요. 다른 코드를 정해 주세요.',409);
+ if(!Array.isArray(b.students)||b.students.length<1||b.students.length>60)fail('학생 명단은 1~60명으로 입력해 주세요.');
+ const numbers=new Set();for(const s of b.students){if(!Number.isInteger(s.number)||s.number<1||s.number>99||typeof s.name!=='string'||!s.name.trim()||s.name.length>20||numbers.has(s.number))fail('번호는 1~99의 서로 다른 수로, 이름은 20자 이내로 입력해 주세요.');numbers.add(s.number);}
+ const region=validateRegion(b.region===undefined?'진주':b.region);
+ const id=crypto.randomUUID();const sql=e.DB;const sorted=[...b.students].sort((a,b)=>a.number-b.number);const initialPasswords=sorted.map(()=>randomToken().slice(0,12));const hashes=await Promise.all(initialPasswords.map(p=>hashPassword(p)));
+ const teacherHash=await hashPassword(b.password),classHash=await hashClassCode(b.code);
+ const statements=[sql.prepare('INSERT INTO classrooms(id,school,label,teacher_password,class_code,created,region) VALUES(?,?,?,?,?,?,?)').bind(id,b.school.trim(),b.label.trim(),teacherHash,classHash,Date.now(),region)];
+ for(let start=0;start<sorted.length;start+=15){const group=sorted.slice(start,start+15);statements.push(sql.prepare('INSERT INTO class_students(id,class_id,number,name,animal,password) VALUES '+group.map(()=>'(?,?,?,?,?,?)').join(',')).bind(...group.flatMap((s,i)=>[id+':'+s.number,id,s.number,s.name.trim(),(start+i)%22,hashes[start+i]])),sql.prepare('INSERT INTO class_works(student_id) VALUES '+group.map(()=>'(?)').join(',')).bind(...group.map(s=>id+':'+s.number)))}await sql.batch(statements);await captureCredential(e,id,'teacher',b.password,teacherHash);await captureCredential(e,id,'class',b.code,classHash);
+
+ return json({id,school:b.school.trim(),label:b.label.trim(),region,students:sorted.map((s,i)=>({id:String(s.number),name:s.name.trim(),password:initialPasswords[i]})),links:{gallery:'/gallery?class='+id,studio:'/studio?class='+id,teacher:'/teacher?class='+id}});
+}
+async function enterClassroomByCode(req:Request,e:Store):Promise<Response>{
+ await limit(e,req,'code-entry',150);
+ const b=await read(req);
+ if(typeof b.code!=='string'||normalizeClassCode(b.code).length<6||normalizeClassCode(b.code).length>64)fail('학급 입장 코드를 확인해 주세요.',401);
+ const preservedRole=await preservedEntryRole(b.code,e);
+ if(preservedRole)return json({handoff:{action:preservedEntryAction,role:preservedRole}});
+ const rooms=await e.DB.prepare("SELECT c.id,c.school,c.label,c.class_code,c.teacher_password FROM classrooms c WHERE NOT EXISTS (SELECT 1 FROM settings WHERE key='class_archived:'||c.id OR key='class_deleting:'||c.id) ORDER BY c.created LIMIT 101").all<{id:string;school:string;label:string;class_code:string;teacher_password:string}>();
+ const matches:{id:string;school:string;label:string;role:'viewer'|'teacher';password?:string}[]=[];
+ for(const room of rooms.results)if(await verifyClassCode(b.code,room.class_code))matches.push({...room,role:'viewer'});
+ if(!matches.length){await limit(e,req,'teacher-code-entry',15);const normalized=normalizeClassCode(b.code);for(const room of rooms.results){const candidate=await verifyPassword(b.code,room.teacher_password)?b.code:normalized!==b.code&&await verifyPassword(normalized,room.teacher_password)?normalized:null;if(candidate)matches.push({...room,role:'teacher',password:candidate})}}
+
+ if(!matches.length)fail('학급 입장 코드를 확인해 주세요.',401);
+ if(matches.length>1&&!b.classId)return json({choices:matches.map(({id,school,label})=>({id,school,label}))});
+ const room=b.classId?matches.find(room=>room.id===b.classId):matches[0];
+ if(!room)fail('학급 입장 코드를 확인해 주세요.',401);
+ const target=new URL(req.url);target.pathname=room.role==='teacher'?'/api/auth/teacher':'/api/auth/class';target.search='';target.searchParams.set('class',room.id);
+ const headers=new Headers(req.headers);headers.delete('content-length');headers.set('Content-Type','application/json');
+ const response=await handleClassroom(new Request(target,{method:'POST',headers,body:JSON.stringify(room.role==='teacher'?{password:room.password}:{code:b.code})}),e);
+ const data=await response.json() as Record<string,unknown>;
+ const sessionCookie=response.headers.get('set-cookie');
+ return json(response.ok?{...data,href:(room.role==='teacher'?'/teacher?class=':'/gallery?class=')+room.id}:data,response.status,sessionCookie?{'Set-Cookie':sessionCookie}:{});
+}
+export async function handleClassroom(req:Request,e:Store):Promise<Response>{try{
+ const url=new URL(req.url),path=url.pathname.replace(/^\/api\//,''),method=req.method,roomId=url.searchParams.get('class')||'';
+ if(method!=='GET'){if(req.headers.get('X-Lantern-Request')!=='1'||(req.headers.get('origin')&&req.headers.get('origin')!==url.origin))fail('허용되지 않은 요청이에요.',403);}
+ if(path==='classrooms/create'&&method==='POST')return await createClassroom(req,e);
+ if(path==='classrooms/enter'&&method==='POST')return await enterClassroomByCode(req,e);
+ if(!/^[a-f0-9-]{36}$/.test(roomId))fail('학급 주소를 확인해 주세요.',404);
+ const d=e.DB;const room=await d.prepare('SELECT * FROM classrooms WHERE id=?').bind(roomId).first<any>();if(!room)fail('학급 전시관을 찾을 수 없어요.',404);if(await d.prepare('SELECT value FROM settings WHERE key=?').bind('class_deleting:'+roomId).first())fail('전체 관리자가 이 학급의 자료를 정리하고 있어요.',410);
+ const session=await classSession(e,req,roomId,path);
+ const external=(s:any)=>s?{role:s.role,studentId:s.student_id?.split(':')[1]||null}:null;
+ const metadata={id:roomId,school:room.school,label:room.label,region:room.region,regionRevision:room.region_revision};const viewerAccess=(await d.prepare('SELECT value FROM settings WHERE key=?').bind('viewer_access:'+roomId).first<any>())?.value||'members';
+ async function login(role:string,studentId:string|null){const raw=randomToken();await d.prepare('INSERT INTO class_sessions(token,class_id,role,student_id,expires) VALUES(?,?,?,?,?)').bind(await digest(raw),roomId,role,studentId,Date.now()+8*3600000).run();return json({...external({role,student_id:studentId}),classroom:metadata},200,{'Set-Cookie':classSessionCookie(req,roomId,role,raw)});}
+ if(path==='status')return json({ready:true,session:external(session),classroom:metadata,viewerAccess});
+ if(path==='auth/logout'&&method==='POST')return await classLogout(e,req,roomId);
+ if(path==='auth/teacher'&&method==='POST'){await limit(e,req,'teacher:'+roomId,15);const b=await read(req);if(!await verifyPassword(String(b.password||''),room.teacher_password))fail('교사 비밀번호를 확인해 주세요.',401);await captureCredential(e,roomId,'teacher',b.password,room.teacher_password);return login('teacher',null);}
+ if(path==='auth/class'&&method==='POST'){if(await d.prepare('SELECT key FROM settings WHERE key=?').bind('class_archived:'+roomId).first())fail('보관 중인 학급이에요. 선생님께 문의해 주세요.',410);await limit(e,req,'class:'+roomId,150);const b=await read(req);if(!await verifyClassCode(String(b.code||''),room.class_code))fail('학급 입장 코드를 확인해 주세요.',401);await captureCredential(e,roomId,'class',b.code,room.class_code);return login('viewer',null);}
+ if(!session)fail('학급 입장 코드로 다시 입장해 주세요.',401);
+ if(session.role!=='teacher'&&await d.prepare('SELECT key FROM settings WHERE key=?').bind('class_archived:'+roomId).first())fail('보관 중인 학급이에요.',410);
+ const sid=roomId+':'+String(session.student_id?.split(':')[1]||'');
+ if(['mine','work','upload','files/delete'].includes(path))assertStudentIdentity(req,session);
+ if(path==='auth/student'&&method==='POST'){
+ const b=await read(req);await limit(e,req,'student:'+roomId+':'+b.id,15);
+ if(b.id==='demo')fail('마지막 번호의 교사용 계정을 선택해 주세요.',401);
+ const example=await classroomExample(e,roomId);
+ if(example?.student.id===String(b.id)){
+  if(!await verifyPassword(String(b.password||''),room.teacher_password))fail('개인 비밀번호를 확인해 주세요.',401);
+  return login('student',roomId+':example');
+ }
+ const student=await d.prepare('SELECT id,name,password FROM class_students WHERE class_id=? AND number=?').bind(roomId,Number(b.id)).first<any>();
+ if(!student||!await verifyPassword(String(b.password||''),student.password))fail('이름과 개인 비밀번호를 확인해 주세요.',401);
+ return login('student',student.id);
+ }
+ if(sid.endsWith(':example')&&['work','upload','files/delete'].includes(path))fail('공통 교사용 예시 작품은 읽기 전용이에요.',403);
+ if(path==='mine'&&method==='GET'&&sid.endsWith(':example')){const example=await classroomExample(e,roomId);if(!example)fail('교사용 예시를 다시 선택해 주세요.',403);return json({profile:example.student,student_id:'example',draft:example.student.published,submitted:example.student.published,published:example.student.published,files:[],revision:0,status:example.student.status,readOnly:true});}
+
+ if(path==='learning-info'&&method==='GET')return json(await readLearningInfo(d,roomId,room.region));
+ if(path==='students'&&method==='GET'){const rows=await d.prepare('SELECT s.number,s.name,s.animal,w.published FROM class_students s LEFT JOIN class_works w ON w.student_id=s.id WHERE s.class_id=? ORDER BY s.number').bind(roomId).all<any>();const example=await classroomExample(e,roomId);return json([...rows.results.map(r=>({id:String(r.number),isTeacherExample:!example&&r.number===22&&r.name==='교사용',name:session.role==='viewer'?r.number+'번 친구':r.name,animal:r.animal,published:session.role==='viewer'&&viewerAccess!=='approved'?null:parse(r.published)})),...(example?[example.student]:[])]);}
+ if(path.startsWith('files/')&&method==='GET'){const id=path.slice(6);let f=await d.prepare('SELECT * FROM class_files WHERE id=? AND class_id=?').bind(id,roomId).first<any>();if(!f){const example=await classroomExample(e,roomId);if(!example?.student.published?.files.includes(id))fail('자료를 찾을 수 없어요.',404);f=example.sourceRoom?await d.prepare('SELECT * FROM class_files WHERE id=? AND class_id=? AND student_id=?').bind(id,example.sourceRoom,example.sourceRoom+':22').first<any>():await d.prepare("SELECT * FROM files WHERE id=? AND student_id='22'").bind(id).first<any>();if(!f)fail('자료를 찾을 수 없어요.',404);return await privateFile(req,e,f)}const w=await d.prepare('SELECT published FROM class_works WHERE student_id=?').bind(f.student_id).first<any>();if(!canReadFile({role:session.role,studentId:session.student_id},f.student_id,id,parse(w?.published)))fail('이 자료를 볼 수 없어요.',403);if(session.role==='viewer'&&viewerAccess!=='approved')fail('학생 개인 인증 후 작품을 감상해 주세요.',403);return await privateFile(req,e,f);}
+ if(path==='mine'&&method==='GET'){if(session.role!=='student')fail('학생으로 로그인해 주세요.',403);const w=await d.prepare('SELECT * FROM class_works WHERE student_id=?').bind(sid).first<any>();const f=await d.prepare('SELECT id,name,type,size FROM class_files WHERE student_id=? AND class_id=? ORDER BY created').bind(sid,roomId).all();const profile=await d.prepare('SELECT number,name,animal FROM class_students WHERE id=? AND class_id=?').bind(sid,roomId).first<any>();return json({...w,student_id:sid.split(':')[1],profile:profile?{id:String(profile.number),name:profile.name,animal:profile.animal}:null,draft:parse(w.draft),submitted:parse(w.submitted),published:parse(w.published),files:f.results});}
+ if((path==='upload'||path==='teacher/restore-file')&&method==='POST'){const restoring=path==='teacher/restore-file';if(restoring?session.role!=='teacher':session.role!=='student')fail('파일 업로드 권한을 확인해 주세요.',403);await limit(e,req,'upload:'+sid,60);if(Number(req.headers.get('content-length'))>MAX_FILE+100000)fail('파일은 20MB 이하로 올려 주세요.',413);const form=await req.formData(),f=form.get('file');if(!(f instanceof File)||f.size>MAX_FILE)fail('파일은 20MB 이하로 올려 주세요.',413);const uploadOwner=restoring?roomId+':'+Number(form.get('number')):sid;if(!await d.prepare('SELECT id FROM class_students WHERE id=? AND class_id=?').bind(uploadOwner,roomId).first())fail('학생을 찾을 수 없어요.',404);const bytes=new Uint8Array(await f.arrayBuffer()),type=checkFile(f.name,bytes);const usage=await d.prepare('SELECT COALESCE(SUM(size),0) AS total FROM class_files WHERE student_id=?').bind(uploadOwner).first<any>();if(usage.total+f.size>200*1024*1024)fail('개인 저장 공간 200MB를 다 사용했어요.',413);const reservation=await reserveUpload(e,roomId,uploadOwner,f.size);const id=crypto.randomUUID();try{await e.BUCKET.put(id,bytes,{httpMetadata:{contentType:type}});const saved=await d.prepare('INSERT INTO class_files(id,class_id,student_id,name,type,size,created) SELECT ?,?,?,?,?,?,? WHERE EXISTS(SELECT id FROM classrooms WHERE id=?) AND EXISTS(SELECT id FROM class_students WHERE id=? AND class_id=?) AND NOT EXISTS(SELECT key FROM settings WHERE key=?)').bind(id,roomId,uploadOwner,f.name.slice(0,150),type,f.size,Date.now(),roomId,uploadOwner,roomId,'class_deleting:'+roomId).run();if(!saved.meta.changes)fail('학급 자료가 정리 중이에요.',410);}catch(err){await e.BUCKET.delete(id);throw err}finally{await releaseUpload(e,reservation)}return json({id,name:f.name.slice(0,150),type,size:f.size});}
+ if(path==='files/delete'&&method==='POST'){if(session.role!=='student')fail('학생으로 로그인해 주세요.',403);const b=await read(req);const f=await d.prepare('SELECT id FROM class_files WHERE id=? AND class_id=? AND student_id=?').bind(b.id,roomId,sid).first();if(!f)fail('파일을 찾을 수 없어요.',404);const w=await d.prepare('SELECT draft,submitted,published FROM class_works WHERE student_id=?').bind(sid).first<any>();if(['draft','submitted','published'].some(k=>parse(w[k])?.files.includes(b.id)))fail('저장·제출·전시 중인 자료는 삭제할 수 없어요.');await e.BUCKET.delete(b.id);await d.prepare('DELETE FROM class_files WHERE id=? AND class_id=? AND student_id=?').bind(b.id,roomId,sid).run();return json({ok:true});}
+ if(path==='work'&&method==='POST'){if(session.role!=='student')fail('학생으로 로그인해 주세요.',403);const b=await read(req),work=validateWork(b.work,b.submit===true);for(const id of work.files){const f=await d.prepare(`SELECT type FROM class_files WHERE id=? AND class_id=? AND student_id=? AND NOT EXISTS(SELECT key FROM settings WHERE key='file_deleting:'||class_files.id)`).bind(id,roomId,sid).first<any>();if(!f)fail('자신의 파일만 첨부할 수 있어요.',403);if(work.chapters?.some(c=>c.pages.some((p:any)=>p.imageId===id))&&!f.type.startsWith('image/'))fail('챕터에는 사진이나 그림을 선택해 주세요.');}const now=new Date().toISOString();const saved=b.submit?await d.prepare("UPDATE class_works SET draft=?,submitted=?,status='pending',feedback='',revision=revision+1,updated=? WHERE student_id=? AND revision=?").bind(JSON.stringify(work),JSON.stringify(work),now,sid,b.revision).run():await d.prepare('UPDATE class_works SET draft=?,revision=revision+1,updated=? WHERE student_id=? AND revision=?').bind(JSON.stringify(work),now,sid,b.revision).run();if(!saved.meta.changes)fail('다른 화면에서 수정되었어요. 새로고침 후 확인해 주세요.',409);return json({ok:true,revision:b.revision+1,updated:now});}
+ if(path.startsWith('teacher/')){if(session.role!=='teacher')fail('교사만 사용할 수 있어요.',403);
+ if(path==='teacher/region'&&method==='POST'){
+ const b=await read(req),region=validateRegion(b.region);
+ if(!Number.isSafeInteger(b.revision)||b.revision<0)fail('지역 설정을 다시 열어 주세요.');
+ const result=await d.prepare('UPDATE classrooms SET region=?,region_revision=region_revision+1 WHERE id=? AND region_revision=?').bind(region,roomId,b.revision).run();
+ if(!result.meta.changes)fail('다른 화면에서 지역 설정이 바뀌었어요. 다시 열어 주세요.',409);
+ return json({ok:true,region,regionRevision:b.revision+1});
+ }
+ if(path==='teacher/learning-info'&&method==='POST')return json(await writeLearningInfo(d,roomId,await read(req),room.region));
+ if(path==='teacher/archives'&&method==='GET')return json((await d.prepare('SELECT number,name,archived FROM student_archives WHERE class_id=? ORDER BY number').bind(roomId).all()).results);
+ if(path==='teacher/storage'&&method==='GET')return json({...await usageForClass(e,roomId),retentionReviewDate:(await d.prepare('SELECT value FROM settings WHERE key=?').bind('retention_review:'+roomId).first<any>())?.value||'',archived:!!await d.prepare('SELECT key FROM settings WHERE key=?').bind('class_archived:'+roomId).first()});
+ if(path==='teacher/unused-files'&&method==='GET')return json(await unusedFiles(e,roomId));
+ if(path==='teacher/backup'&&method==='GET')return json(await classBackup(e,roomId));
+if(path==='teacher/works'&&method==='GET'){const rows=await d.prepare('SELECT s.number,s.name,s.animal,w.* FROM class_students s JOIN class_works w ON w.student_id=s.id WHERE s.class_id=? ORDER BY s.number').bind(roomId).all<any>();const example=await classroomExample(e,roomId);return json([...rows.results.map(r=>({...r,id:String(r.number),isTeacherExample:!example&&r.number===22&&r.name==='교사용',student_id:String(r.number),draft:parse(r.draft),submitted:parse(r.submitted),published:parse(r.published)})),...(example?[example.student]:[])]);}
+ const b=await read(req),target=roomId+':'+String(b.id);if(b.id==='demo')fail('제거된 계정이에요.',404);if(b.id!==undefined){const example=await classroomExample(e,roomId);if(example?.student.id===String(b.id))fail('공통 교사용 예시는 읽기 전용이에요.',403);}
+ if(path==='teacher/cleanup')return json(await cleanupFiles(e,roomId,b.ids));
+ if(path==='teacher/restore-draft'){const owner=roomId+':'+Number(b.number);if(!await d.prepare('SELECT id FROM class_students WHERE class_id=? AND id=?').bind(roomId,owner).first())fail('학생을 찾을 수 없어요.',404);const w=validateWork(b.work,false);for(const fid of w.files)if(!await d.prepare(`SELECT id FROM class_files WHERE id=? AND class_id=? AND student_id=? AND NOT EXISTS(SELECT key FROM settings WHERE key='file_deleting:'||class_files.id)`).bind(fid,roomId,owner).first())fail('복구 파일의 소유자를 확인해 주세요.',403);await d.prepare('UPDATE class_works SET draft=?,revision=revision+1 WHERE student_id=?').bind(JSON.stringify(w),owner).run();return json({ok:true})}
+ if(path==='teacher/delete-class')return json(await deleteOwnClass(e,room,b));if(path==='teacher/renumber')return json(await renumberStudent(e,roomId,Number(b.from),Number(b.to)));
+ if(path==='teacher/roster')return json(await editRoster(e,roomId,b));if(path==='teacher/restore-student')return json(await restoreStudent(e,roomId,Number(b.number)));
+ if(path==='teacher/password'){const student=await d.prepare('SELECT name FROM class_students WHERE class_id=? AND id=?').bind(roomId,target).first<any>();if(!student)fail('학생을 찾을 수 없어요.',404);const password=randomToken().slice(0,12);await d.batch([d.prepare('UPDATE class_students SET password=? WHERE class_id=? AND id=?').bind(await hashPassword(password),roomId,target),d.prepare('DELETE FROM class_sessions WHERE class_id=? AND student_id=?').bind(roomId,target)]);return json({password});}
+ if(path==='teacher/review'){let result;if(b.action==='approve')result=await d.prepare("UPDATE class_works SET published=submitted,status='approved',feedback='',revision=revision+1 WHERE student_id=? AND revision=? AND submitted IS NOT NULL").bind(target,b.revision).run();else if(b.action==='request')result=await d.prepare("UPDATE class_works SET status='revision',feedback=?,revision=revision+1 WHERE student_id=? AND revision=?").bind(String(b.feedback||'작품을 다시 확인해 주세요.').slice(0,1000),target,b.revision).run();else if(b.action==='hide')result=await d.prepare("UPDATE class_works SET published=NULL,status='hidden',revision=revision+1 WHERE student_id=?").bind(target).run();else fail('작업을 확인해 주세요.');if(!result.meta.changes)fail('새 수정본이 있어요. 다시 열어 확인해 주세요.',409);return json({ok:true});}
+ if(path==='teacher/animal'){if(!Number.isInteger(b.animal)||b.animal<0||b.animal>21)fail('동물을 선택해 주세요.');if(!await d.prepare('SELECT id FROM class_students WHERE class_id=? AND id=?').bind(roomId,target).first())fail('학생을 찾을 수 없어요.',404);await d.prepare('WITH old AS MATERIALIZED (SELECT animal AS prior FROM class_students WHERE id=? AND class_id=?), partner AS MATERIALIZED (SELECT id FROM class_students WHERE class_id=? AND animal=? AND id<>? ORDER BY number LIMIT 1) UPDATE class_students SET animal=CASE WHEN id=? THEN ? ELSE old.prior END FROM old WHERE class_id=? AND (id=? OR id IN (SELECT id FROM partner))').bind(target,roomId,roomId,b.animal,target,target,b.animal,roomId,target).run();return json({ok:true});}
+ if(path==='teacher/settings'){if(typeof b.code==='string'&&await preservedEntryRole(b.code,e))fail('이미 사용 중인 입장 코드예요. 다른 코드를 정해 주세요.',409);if(b.retentionReviewDate!==undefined){if(typeof b.retentionReviewDate!=='string'||!/^$|^\d{4}-\d{2}-\d{2}$/.test(b.retentionReviewDate))fail('보관 검토일을 확인해 주세요.');await d.prepare('INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').bind('retention_review:'+roomId,b.retentionReviewDate).run();}if(b.archived!==undefined){if(typeof b.archived!=='boolean')fail('학급 보관 상태를 확인해 주세요.');if(b.archived)await d.batch([d.prepare('INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').bind('class_archived:'+roomId,'1'),d.prepare("DELETE FROM class_sessions WHERE class_id=? AND role<>'teacher'").bind(roomId)]);else await d.prepare('DELETE FROM settings WHERE key=?').bind('class_archived:'+roomId).run();}if(b.viewerAccess!==undefined){if(!['members','approved'].includes(b.viewerAccess))fail('공개 범위를 확인해 주세요.');await d.prepare('INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').bind('viewer_access:'+roomId,b.viewerAccess).run();}if(b.school!==undefined){if(typeof b.school!=='string'||!b.school.trim().endsWith('초등학교')||b.school.length>60)fail('학교 이름을 확인해 주세요.');await d.prepare('UPDATE classrooms SET school=? WHERE id=?').bind(b.school.trim(),roomId).run();}if(b.label!==undefined){if(typeof b.label!=='string'||!b.label.trim()||b.label.length>40)fail('학년·반을 확인해 주세요.');await d.prepare('UPDATE classrooms SET label=? WHERE id=?').bind(b.label.trim(),roomId).run();}if(b.code!==undefined&&(typeof b.code!=='string'||normalizeClassCode(b.code).length<6||normalizeClassCode(b.code).length>64))fail('입장 코드는 6~64자로 정해 주세요.');if(b.password!==undefined&&(typeof b.password!=='string'||b.password.length<8||b.password.length>128))fail('교사 비밀번호는 8~128자로 정해 주세요.');const nextClassHash=b.code?await hashClassCode(b.code):null,nextTeacherHash=b.password?await hashPassword(b.password):null;if(nextClassHash)await d.batch([d.prepare('UPDATE classrooms SET class_code=? WHERE id=?').bind(nextClassHash,roomId),d.prepare("DELETE FROM class_sessions WHERE class_id=? AND role<>'teacher'").bind(roomId)]);if(nextTeacherHash)await d.prepare('UPDATE classrooms SET teacher_password=? WHERE id=?').bind(nextTeacherHash,roomId).run();if(nextClassHash)await captureCredential(e,roomId,'class',b.code,nextClassHash);if(nextTeacherHash)await captureCredential(e,roomId,'teacher',b.password,nextTeacherHash);return json({ok:true});}
+ }
+ return json({error:'페이지를 찾을 수 없어요.'},404);
+}catch(err:any){if(err.message?.includes('CLASS_CAPACITY')||err.message?.includes('CLASS_CREATION_PAUSED'))return json({error:'신규 학급 개설 한도 또는 중지 설정을 확인해 주세요.'},503);return json({...(err.code?{code:err.code}:{}),error:err.status?err.message:err.message?.includes('파일')||err.message?.includes('챕터')||err.message?.includes('제목')?err.message:'처리하지 못했어요. 잠시 후 다시 시도해 주세요.'},err.status||400)}}
