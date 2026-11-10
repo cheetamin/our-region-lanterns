@@ -22,4 +22,6 @@ https://our-region-lanterns.cheetamin.workers.dev/
 ## 개발
 Node 24 이상. `npm test`, `npm run typecheck`, `npm run build:external`.
 
+공개 배포는 기존 React 화면을 정적 파일로 빌드하고, 인증·작품 API만 작은 Worker에서 실행합니다. 화면 접속마다 서버 렌더링을 반복하지 않습니다. 배포 명령은 `npx wrangler deploy --config dist/server/wrangler.json`이며 기존 D1 바인딩과 비밀 설정을 사용합니다. 로컬 검증은 빌드 후 `node scripts/smoke-external.mjs`로 실행합니다. 실제 운영 데이터 대신 별도의 로컬 D1에 가상 학급을 만듭니다.
+
 치타민쌤 제작. 교실 내 비영리 수업 활용 외 복제·수정·상업적 이용은 제작자의 허락을 받아 주세요.
