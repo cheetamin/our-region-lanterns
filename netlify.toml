@@ -1,0 +1,15 @@
+# Netlify serves only the static frontend. Cloudflare remains the API + D1 backend.
+[build]
+command = "pnpm exec vite build --config vite.static.config.ts"
+publish = "dist/client"
+
+[build.environment]
+NODE_VERSION = "24"
+# This deployment uses Vite, even though package.json also includes Next.js.
+NETLIFY_NEXT_PLUGIN_SKIP = "true"
+
+# The Edge Function handles /api/* requests before this SPA fallback.
+[[redirects]]
+from = "/*"
+to = "/index.html"
+status = 200
