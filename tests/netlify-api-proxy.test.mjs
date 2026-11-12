@@ -10,11 +10,11 @@ async function withFetch(stub, run) {
   try { return await run(); } finally { globalThis.fetch = original; }
 }
 
-test('Netlify frontend can reach the existing Worker with cookies and JSON body', async () => {
+test('Netlify frontend can reach the isolated staging Worker with cookies and JSON body', async () => {
   await withFetch(async request => {
-    assert.equal(request.url, 'https://our-region-lanterns.cheetamin.workers.dev/api/classrooms/enter?class=demo');
+    assert.equal(request.url, 'https://our-region-netlify-staging.cheetamin.workers.dev/api/classrooms/enter?class=demo');
     assert.equal(request.method, 'POST');
-    assert.equal(request.headers.get('origin'), 'https://our-region-lanterns.cheetamin.workers.dev');
+    assert.equal(request.headers.get('origin'), 'https://our-region-netlify-staging.cheetamin.workers.dev');
     assert.equal(request.headers.get('cookie'), 'lantern_session=abc');
     assert.equal(request.headers.get('x-lantern-request'), '1');
     assert.equal(await request.text(), '{"code":"demo"}');
@@ -42,7 +42,7 @@ test('CSRF origin mismatch and missing custom header never reach backend', async
 
 test('GET requests proxy while non-GET/POST methods fail closed', async () => {
   await withFetch(async request => {
-    assert.equal(request.url,'https://our-region-lanterns.cheetamin.workers.dev/api/status');
+    assert.equal(request.url,'https://our-region-netlify-staging.cheetamin.workers.dev/api/status');
     return Response.json({ready:true});
   }, async () => {
     const ok = await proxyApi(new Request(host+'/api/status'));

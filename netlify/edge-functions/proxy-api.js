@@ -1,6 +1,6 @@
-// Netlify serves the static client; private classrooms remain on the existing
-// Cloudflare Worker and its existing D1 database.
-const BACKEND_ORIGIN = 'https://our-region-lanterns.cheetamin.workers.dev';
+// Netlify staging uses a dedicated Worker and D1 database.
+// Never forward staging writes to the Cloudflare production backend.
+const BACKEND_ORIGIN = 'https://our-region-netlify-staging.cheetamin.workers.dev';
 
 function errorResponse(status, message) {
   return Response.json({ error: message }, {

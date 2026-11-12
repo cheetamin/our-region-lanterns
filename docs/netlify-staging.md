@@ -1,50 +1,60 @@
-# Netlify staging deployment (not a production cutover)
+# Netlify staging (isolated from production)
 
-This is an optional second frontend hostname for the public regional lantern site.
-The existing Cloudflare Worker and D1 database remain the authoritative backend.
-Do **not** delete, replace, migrate, or reinitialize the classroom database.
+Frontend: https://our-region-lanterns-staging.netlify.app
+Branch: codex/netlify-staging-20261112 (PR #1; do not merge into main).
 
-## Import from GitHub
+## Build
 
-1. Open Netlify **Add new project > Import an existing project > GitHub**.
-2. Authorize access to the GitHub account **cheetamin** and select
-   **cheetamin/our-region-lanterns**.
-3. Select the Netlify staging branch after this configuration has been reviewed.
-   (Do not deploy a Next.js SSR build: this repository's Netlify output is the
-   existing Vite static client under dist/client.)
-4. Verify the build settings loaded from netlify.toml:
-   - Build command: pnpm exec vite build --config vite.static.config.ts
-   - Publish directory: dist/client
-   - Node version: 24
-5. Deploy only as a staging site. Never replace the existing Cloudflare DNS or
-   Worker route for the working classroom site.
+- Build command: `pnpm exec vite build --config vite.static.config.ts`
+- Publish directory: `dist/client`
+- Node: 24; pnpm: 11.25.0
+- `NETLIFY_NEXT_PLUGIN_SKIP=true` prevents Next.js auto-detection from inspecting the Vite output.
 
-## API flow and safety
+## Storage isolation
 
-Netlify Edge Function /api/* proxies to the existing Cloudflare Worker.
-The browser's Origin is checked before the proxy sets the backend origin.
-Cookies and request bodies must be forwarded, and every API response is marked
-Cache-Control: no-store.
+The Edge Function forwards `/api/*` only to
+`https://our-region-netlify-staging.cheetamin.workers.dev`.
+That dedicated Worker binds `DB` to `our-region-netlify-staging-db`
+(`46f47d93-dfa5-4ce8-b5ba-33fc98623ed8`) and uses `FILE_STORAGE=d1`.
+It contains synthetic test data only. No production student data or credentials
+were copied. Do not change the target to the production Worker for testing.
 
-This does NOT relocate the API or database to Netlify. Do not point the
-frontend directly at a different D1 database or change student credentials.
+The existing `our-region-lanterns` Worker, database, DNS, routes and main branch
+are not part of this staging deployment.
 
-## Tests and manual verification before rollout
+## Backend updates
 
-- Unit test: node --test tests/netlify-api-proxy.test.mjs
-- Build: pnpm exec vite build --config vite.static.config.ts
-- Netlify deployment logs must show a successful build and edge function.
-- On the **staging** hostname, test GET /api/status, create a throwaway class
-  using nonstudent data, log in, save a draft, upload a sample image, reload,
-  and log out. Confirm that the cookie remains on the Netlify host.
-- Confirm that cross-origin POSTs fail with 403.
-- Run a classroom-sized load test before using the staging hostname for real
-  students. Netlify proxying may change the IP address used for backend rate
-  limiting, so the old 30-user test on Cloudflare does not validate this path.
-- Do not make any DNS or production URL changes before these tests pass.
+`wrangler.netlify-staging.jsonc` is the dedicated API-only configuration.
+Deploy only this configuration for staging. It does not replace the production
+`wrangler.external.jsonc` file. The initial API bundle was built from the staging
+branch using `scripts/build-external.mjs` and deployed to the dedicated Worker
+through the dashboard. All seven SQL migrations were applied to the empty
+staging DB through its dashboard console.
+
+For future migrations and API deployments use the explicit staging config:
+
+```
+pnpm exec wrangler d1 migrations apply DB --remote --config wrangler.netlify-staging.jsonc
+pnpm exec wrangler deploy --config wrangler.netlify-staging.jsonc
+```
+
+Verify the database ID and Worker name before either command. Never run these
+commands against the production config as part of testing.
+
+## Verification
+
+- `node --test tests/netlify-api-proxy.test.mjs`
+- Static Vite build
+- Actual Netlify hostname: class creation; teacher and student sign-in; draft
+  save/reload; sample PNG upload and authenticated download; logout.
+- Cookies must remain scoped to the Netlify hostname.
+- Foreign-Origin POST requests and requests missing X-Lantern-Request fail 403.
+
+Classroom-wide concurrency testing is a separate rollout check: proxying can
+change the IP seen by backend rate limits. Do not assume the old Cloudflare
+load tests cover this path.
 
 ## Rollback
 
-The original Cloudflare hostname continues to serve the full app. If Netlify
-staging fails, stop using or unpublish the staging site; there is no database
-migration to reverse. This draft intentionally does not alter main.
+Stop using or unpublish this Netlify staging project. Production remains on its
+existing Cloudflare hostname. No production database migration is required.
