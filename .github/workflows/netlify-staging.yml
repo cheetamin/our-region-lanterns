@@ -1,0 +1,34 @@
+name: Netlify staging checks
+on:
+  pull_request:
+    paths:
+      - 'netlify.toml'
+      - 'netlify/**'
+      - 'tests/netlify-api-proxy.test.mjs'
+      - '.github/workflows/netlify-staging.yml'
+      - 'vite.static.config.ts'
+      - 'client/**'
+      - 'components/**'
+  workflow_dispatch:
+
+jobs:
+  netlify-stage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.25.0
+          run_install: false
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Test origin validation, cookie forwarding, and error handling
+        run: node --test tests/netlify-api-proxy.test.mjs
+      - name: Build Netlify static frontend
+        run: pnpm exec vite build --config vite.static.config.ts
+      - name: Verify static output
+        run: test -s dist/client/index.html
