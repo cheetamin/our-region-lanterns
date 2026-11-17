@@ -34,7 +34,7 @@ export async function handleAdmin(req:Request,e:Env){try{
  const room=await e.DB.prepare('SELECT id FROM classrooms WHERE id=?').bind(b.classId).first<any>();
  if(!room)fail('학급을 찾을 수 없어요.',404);
  if(await marker(e,'class_deleting:'+room.id))fail('정리 중인 학급이에요.',410);
- const next=randomToken()+randomToken();
+ const next=randomToken().slice(0,32);
  const hashed=await hashPassword(next);
  await e.DB.prepare('UPDATE classrooms SET teacher_password=? WHERE id=?').bind(hashed,room.id).run();
  await captureCredential(e,room.id,'teacher',next,hashed);
