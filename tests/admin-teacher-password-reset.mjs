@@ -18,12 +18,63 @@ await call('teacher','auth/teacher'+suffix,{password:initial.password});
 await call('student','auth/class'+suffix,{code:initial.code});
 await call('student','auth/student'+suffix,{id:'1',password:classroom.students[0].password});
 await call('guest','admin/teacher-password-reset',{classId:classroom.id,password:e.ADMIN_PASSWORD},401);
+await call('teacher','admin/teacher-password-reset',{classId:classroom.id,password:e.ADMIN_PASSWORD},401);
+await call('student','admin/teacher-password-reset',{classId:classroom.id,password:e.ADMIN_PASSWORD},401);
+const other = await call('create','classrooms/create',{
+ ...initial,school:'별도시험초등학교',password:'other-teacher-password',code:'other-class-code',
+});
+const otherSuffix = '?class='+other.id;
+await call('other','auth/teacher'+otherSuffix,{password:'other-teacher-password'});
+await call('other','admin/teacher-password-reset',{classId:classroom.id,password:e.ADMIN_PASSWORD},401);
 await call('owner','admin/login',{password:e.ADMIN_PASSWORD});
 await call('owner','admin/teacher-password-reset',{classId:classroom.id,password:'incorrect'},401);
 const before=await e.DB.prepare('SELECT id,class_code,teacher_password FROM classrooms WHERE id=?').bind(classroom.id).first();
 const studentBefore=(await e.DB.prepare('SELECT id,name,password FROM class_students WHERE class_id=?').bind(classroom.id).all()).results;
 const workBefore=(await e.DB.prepare('SELECT student_id,draft,submitted,published FROM class_works WHERE student_id LIKE ?').bind(classroom.id+'%').all()).results;
-const reset=await call('owner','admin/teacher-password-reset',{classId:classroom.id,password:e.ADMIN_PASSWORD});
+const prepare = e.DB.prepare;
+e.DB.prepare = query => {
+ const statement = prepare(query);
+ if (!query.startsWith('DELETE FROM class_sessions')) return statement;
+ return {bind() { return {async run() { throw new Error('Simulated storage failure'); }}; }};
+};
+try {
+ const failedReset = await fetchInProcess('https://test.local/api/admin/teacher-password-reset', {
+  method:'POST', headers:{Origin:'https://test.local','X-Lantern-Request':'1',
+   'Content-Type':'application/json',Cookie:cookies.owner},
+  body:JSON.stringify({classId:classroom.id,password:e.ADMIN_PASSWORD}),
+ });
+ assert.equal(failedReset.status,503);
+} finally {
+ e.DB.prepare = prepare;
+}
+assert.deepEqual(await e.DB.prepare('SELECT id,class_code,teacher_password FROM classrooms WHERE id=?').bind(classroom.id).first(),before);
+await call('teacher','teacher/works'+suffix);
+let insertReached;
+let resumeInsert;
+const waitingForInsert = new Promise(resolve => { insertReached = resolve; });
+const continueInsert = new Promise(resolve => { resumeInsert = resolve; });
+e.DB.prepare = query => {
+ const statement = prepare(query);
+ if (!query.startsWith('INSERT INTO class_sessions(')) return statement;
+ return {bind(...args) {
+  const bound = statement.bind(...args);
+  return {async run() {
+   insertReached();
+   await continueInsert;
+   return bound.run();
+  }};
+ }};
+};
+const staleLogin = call('racing','auth/teacher'+suffix,{password:initial.password},401);
+await waitingForInsert;
+e.DB.prepare = prepare;
+let reset;
+try {
+ reset=await call('owner','admin/teacher-password-reset',{classId:classroom.id,password:e.ADMIN_PASSWORD});
+} finally {
+ resumeInsert();
+}
+await staleLogin;
 assert.ok(reset.newPassword.length>=16);
 assert.notEqual(reset.newPassword,initial.password);
 const after=await e.DB.prepare('SELECT id,class_code,teacher_password FROM classrooms WHERE id=?').bind(classroom.id).first();
@@ -38,6 +89,8 @@ await call('old','auth/teacher'+suffix,{password:initial.password},401);
 await call('new','auth/teacher'+suffix,{password:reset.newPassword});
 await call('student','mine'+suffix);
 await call('viewer','auth/class'+suffix,{code:initial.code});
+await call('other','teacher/works'+otherSuffix);
+await call('otherNewSession','auth/teacher'+otherSuffix,{password:'other-teacher-password'});
 const shown=await call('owner','admin/credentials',{classId:classroom.id,password:e.ADMIN_PASSWORD});
 assert.equal(shown.teacherCode,reset.newPassword);
 assert.equal(shown.classCode,initial.code);
